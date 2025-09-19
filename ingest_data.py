@@ -1,87 +1,73 @@
-from flask import Flask, request, jsonify
-from elasticsearch import Elasticsearch
+import pandas as pd
+from elasticsearch import Elasticsearch, helpers
 from sentence_transformers import SentenceTransformer
 
-# === Setup ===
-app = Flask(__name__)
+csv_file = "pitchhunt.csv"  # update path if needed
+df = pd.read_csv(csv_file)
 
-es = Elasticsearch("http://localhost:9200")  # no security
+#Connect to Elasticsearch 
+es = Elasticsearch("http://localhost:9200")
+
 index_name = "pitchhunt"
 
-# Load embedding model once
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-# === 1) Search by Profession (keyword match) ===
-@app.route("/search/profession", methods=["POST"])
-def search_profession():
-    data = request.get_json()
-    profession = data.get("q") if data else None
-    if not profession:
-        return jsonify({"error": "Missing 'q' in request body"}), 400
-
-    query = {
-        "_source": {"excludes": ["field_of_interest_vector"]},
-        "query": {
-            "match": {
-                "Profession": profession
-            }
+#Define Index Mapping 
+mapping = {
+    "mappings": {
+        "properties": {
+            "Name": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+            "Email": {"type": "keyword"},
+            "Phone number": {"type": "keyword"},
+            "City": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+            "Profession": {"type": "keyword"},
+            "Field of Interest": {"type": "text"},
+            "field_of_interest_vector": {
+                "type": "dense_vector",
+                "dims": 384,
+                "index": "true",
+                "similarity": "cosine",
+            },
+            "Why would you be interested in a platform that helps you build meaningful professional connections?": {
+                "type": "text"
+            },
+            "How often do you network professionally?": {"type": "keyword"}
         }
     }
-
-    res = es.search(index=index_name, body=query)
-    hits = [hit["_source"] for hit in res["hits"]["hits"]]
-    return jsonify(hits)
+}
 
 
-# === 2) Search by City (keyword match) ===
-@app.route("/search/city", methods=["POST"])
-def search_city():
-    data = request.get_json()
-    city = data.get("q") if data else None
-    if not city:
-        return jsonify({"error": "Missing 'q' in request body"}), 400
 
-    query = {
-        "_source": {"excludes": ["field_of_interest_vector"]},
-        "query": {
-            "match": {
-                "City": city
-            }
-        }
+if es.indices.exists(index=index_name):
+    es.indices.delete(index=index_name)
+es.indices.create(index=index_name, body=mapping)
+
+# Load Embedding Model 
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+
+actions = []
+for i, row in df.iterrows():
+    # Generate embedding for "Field of Interest"
+    embedding = model.encode(row["Field of Interest"]).tolist()
+
+    doc = {
+        "Name": row["Name"],
+        "Email": row["Email"],
+        "Phone number": str(row["Phone number"]),
+        "City": row["City"],
+        "Profession": row["Profession"],
+        "Field of Interest": row["Field of Interest"],
+        "field_of_interest_vector": embedding,
+        "Why would you be interested in a platform that helps you build meaningful professional connections?": row["Why would you be interested in a platform that helps you build meaningful professional connections?"],
+        "How often do you network professionally?": row["How often do you network professionally?"]
     }
 
-    res = es.search(index=index_name, body=query)
-    hits = [hit["_source"] for hit in res["hits"]["hits"]]
-    return jsonify(hits)
+    actions.append({
+        "_index": index_name,
+        "_id": i + 1,
+        "_source": doc
+    })
 
 
-# === 3) Semantic Search on Field of Interest (kNN) ===
-@app.route("/search/field_of_interest", methods=["POST"])
-def search_field_of_interest():
-    data = request.get_json()
-    user_query = data.get("q") if data else None
-    if not user_query:
-        return jsonify({"error": "Missing 'q' in request body"}), 400
+helpers.bulk(es, actions)
 
-    # Encode query using sentence-transformers
-    query_vector = model.encode(user_query).tolist()
-
-    query = {
-        "_source": {"excludes": ["field_of_interest_vector"]},
-        "knn": {
-                "field":"field_of_interest_vector",
-                "query_vector": query_vector,
-                "k": 2 ,
-                "num_candidates":5 # top results
-            }
-        }
-    
-
-    res = es.search(index=index_name, body=query)
-    hits = [hit["_source"] for hit in res["hits"]["hits"]]
-    return jsonify(hits)
-
-
-# === Run Flask App ===
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True)
+print(f"Indexed {len(actions)} documents into index '{index_name}'")
